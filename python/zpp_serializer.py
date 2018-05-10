@@ -42,6 +42,18 @@ for kind in (Uint64, Uint32, Uint16, Uint8, Int64, Int32, Int16, Int8, Float, Do
     kind.deserialize = struct.Struct(kind.tag).unpack
     kind.__zpp_member__ = len(kind.serialize(kind()))
 
+def make_member(member_type, value):
+    if hasattr(member_type, '__zpp_member__'):
+        return member_type(value)
+
+    if hasattr(member_type.__zpp_class__, 'container'):
+        return member_type(value)
+
+    if not isinstance(value, member_type):
+        raise TypeError("Cannot convert from %s to %s." % (type(value).__name__, member_type.__name__))
+
+    return value
+
 class serializable(object):
     def __init__(self):
         self.previous_trace = sys.gettrace()
@@ -86,8 +98,8 @@ class serializable(object):
                 member_type = member
                 if type(member_type) is not type:
                     member_type = type(member_type)
-                object.__setattr__(self, name, member_type(value))
-            except AttributeError, error:
+                return object.__setattr__(self, name, make_member(member_type, value))
+            except AttributeError as error:
                 raise TypeError("Type '%s' has no member named '%s'." % (type(self).__name__, name))
 
         def to_string(self, level=0, name=None):
@@ -231,6 +243,8 @@ def printable_container(cls):
 @printable_container
 class Vector(object):
     class __zpp_class__(object):
+        container = None
+
         @staticmethod
         def serialize(self, archive):
             archive(SizeType(len(self.items)))
@@ -240,35 +254,37 @@ class Vector(object):
         @staticmethod
         def deserialize(self, archive):
             size = archive(SizeType)
-            self.items = [self.element()] * size
+            self.items = [self.element() for index in xrange(size)]
             if hasattr(self.element, '__zpp_member__'):
                 for index in xrange(size):
                     self.items[index] = archive(self.element)
             else:
-                for index in xrange(size):
-                    archive(item[index])
+                for item in self.items:
+                    archive(item)
 
     def __init__(self, values=None):
         self.items = []
         if values:
-            self.items = [self.element(value) for value in values]
+            self.items = [make_member(self.element, value) for value in values]
 
     def __getitem__(self, index):
         return self.items[index]
 
     def __setitem__(self, index, value):
-        self.items[index] = self.element(value)
+        self.items[index] = make_member(self.element, value)
 
     def __getslice__(self, begin, end):
         return self.items[begin:end]
 
     def __setslice__(self, begin, end, sequence):
-        self.items[begin:end] = [self.element(item) for item in sequence]
+        self.items[begin:end] = [make_member(self.element, item) for item in sequence]
 
 @type_and_size_dependent
 @printable_container
 class Array(object):
     class __zpp_class__(object):
+        container = None
+
         @staticmethod
         def serialize(self, archive):
             for item in self.items:
@@ -276,26 +292,26 @@ class Array(object):
 
         @staticmethod
         def deserialize(self, archive):
-            self.items = [self.element()] * self.size
+            self.items = [self.element() for index in xrange(self.size)]
             if hasattr(self.element, '__zpp_member__'):
                 for index in xrange(self.size):
                     self.items[index] = archive(self.element)
             else:
-                for index in xrange(self.size):
-                    archive(item[index])
+                for item in self.items:
+                    archive(item)
 
     def __init__(self, values=None):
-        self.items = [self.element()] * self.size
+        self.items = [self.element() for index in range(self.size)]
         if values:
             if len(values) != self.size:
                 raise ValueError("Array size mismatch.")
-            self.items = [self.element(value) for value in values]
+            self.items = [make_member(self.element, value) for value in values]
 
     def __getitem__(self, index):
         return self.items[index]
 
     def __setitem__(self, index, value):
-        self.items[index] = self.element(value)
+        self.items[index] = make_member(self.element, value)
 
     def __getslice__(self, begin, end):
         return self.items[begin:end]
@@ -303,7 +319,54 @@ class Array(object):
     def __setslice__(self, begin, end, sequence):
         if end > self.size:
             raise ValueError("This operation will adjust the length of the array.")
-        self.items[begin:end] = [self.element(item) for item in sequence]
+        self.items[begin:end] = [make_member(self.element, item) for item in sequence]
+
+class String(object):
+    class __zpp_class__(object):
+        container = None
+
+        @staticmethod
+        def serialize(self, archive):
+            archive(SizeType(len(self.items)))
+            for item in self.items:
+                archive(item)
+
+        @staticmethod
+        def deserialize(self, archive):
+            size = archive(SizeType)
+            self.items = [Uint8() for index in range(size)]
+            for index in xrange(size):
+                self.items[index] = archive(Uint8)
+
+    def __init__(self, values=None):
+        self.items = []
+        if values:
+            self.items = [Uint8(ord(value)) for value in values]
+
+    def __getitem__(self, index):
+        return chr(self.items[index])
+
+    def __setitem__(self, index, value):
+        self.items[index] = Uint8(ord(value))
+
+    def __getslice__(self, begin, end):
+        return self.items[begin:end]
+
+    def __setslice__(self, begin, end, sequence):
+        self.items[begin:end] = [Uint8(ord(item)) for item in sequence]
+
+    def __str__(self, level=0, name=None):
+        prefix = ' ' * level * 4
+        string = ''.join([chr(item) for item in self.items])
+        if not level:
+            return string
+        if name:
+            result = prefix + name + ": class " + type(self).__name__ + \
+                    "('" + string + "')"
+        else:
+            result = prefix + ": class " + type(self).__name__ + \
+                    "('" + string + "')"
+        return result
 
 class MemoryOutputArchive(object):
     def __init__(self, data):
@@ -344,49 +407,3 @@ class MemoryInputArchive(object):
 
         for item in args:
             item.__zpp_class__.deserialize(item, self)
-        
-
-class String(object):
-    class __zpp_class__(object):
-        @staticmethod
-        def serialize(self, archive):
-            archive(SizeType(len(self.items)))
-            for item in self.items:
-                archive(item)
-
-        @staticmethod
-        def deserialize(self, archive):
-            size = archive(SizeType)
-            self.items = [Uint8()] * size
-            for index in xrange(size):
-                self.items[index] = archive(Uint8)
-
-    def __init__(self, values=None):
-        self.items = []
-        if values:
-            self.items = [Uint8(ord(value)) for value in values]
-
-    def __getitem__(self, index):
-        return chr(self.items[index])
-
-    def __setitem__(self, index, value):
-        self.items[index] = Uint8(ord(value))
-
-    def __getslice__(self, begin, end):
-        return self.items[begin:end]
-
-    def __setslice__(self, begin, end, sequence):
-        self.items[begin:end] = [Uint8(ord(item)) for item in sequence]
-
-    def __str__(self, level=0, name=None):
-        prefix = ' ' * level * 4
-        string = ''.join([chr(item) for item in self.items])
-        if not level:
-            return string
-        if name:
-            result = prefix + name + ": class " + type(self).__name__ + \
-                    "('" + string + "')"
-        else:
-            result = prefix + ": class " + type(self).__name__ + \
-                    "('" + string + "')"
-        return result
