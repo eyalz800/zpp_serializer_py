@@ -2,6 +2,16 @@ import struct
 import sys
 import hashlib
 
+__all__ = [
+    'Uint64', 'Uint32', 'Uint16', 'Uint8',
+    'Int64', 'Int32', 'Int16', 'Int8',
+    'Float', 'Double', 'Bool',
+    'serializable',
+    'polymorphic',
+    'Vector', 'Array', 'BasicString', 'String', 'WString',
+    'MemoryInputArchive', 'MemoryOutputArchive'
+    ]
+
 class Uint64(long):
     tag = '<Q'
 
