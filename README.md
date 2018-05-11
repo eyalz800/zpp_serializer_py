@@ -90,12 +90,14 @@ class B(A):
 class C(B):
     m = zpp_serializer.Uint32
     s = zpp_serializer.String
+    w = zpp_serializer.WString
 
 def main():
     c = C(i=0x1337, j=0x1338, k=1, l=3, m=7)
     c.v = [1, 2, 3]
     c.a[1:3] = [5, 6]
     c.s = "hello world"
+    c.w = u"hello world"
     data = bytearray()
     out = zpp_serializer.MemoryOutputArchive(data)
     inp = zpp_serializer.MemoryInputArchive(data)
