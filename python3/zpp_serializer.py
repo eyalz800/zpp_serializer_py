@@ -63,11 +63,12 @@ class SerializationGenerator(object):
         self.code.level += 1
         self.item_id = 0
         self.shortcut_id = 0
+        self.archive_generator = self.archive_type.CodeGenerator(self.code)
 
     def generate_code(self):
-        self.archive_type.generate_code_start(self.code)
+        self.archive_generator.generate_start()
         self._generate_code(self.cls, 'self')
-        self.archive_type.generate_code_end(self.code)
+        self.archive_generator.generate_end()
         zpp_class = self.cls.__zpp_class__
         if self.mode == 'deserialize':
            if hasattr(zpp_class, 'serialization_id') or zpp_class.fundamental:
@@ -86,11 +87,11 @@ class SerializationGenerator(object):
 
     def _generate_code(self, cls, variable_name):
         if not hasattr(cls, '__zpp_class__'):
-            self.archive_type.generate_code(cls, variable_name, self.code)
+            self.archive_generator.generate(cls, variable_name)
             return
 
         if cls.__zpp_class__.trivially_copyable:
-            self.archive_type.generate_code(cls, variable_name, self.code)
+            self.archive_generator.generate(cls, variable_name)
             return
 
         if cls.__zpp_class__.container:
@@ -105,10 +106,9 @@ class SerializationGenerator(object):
             if cls.element.__zpp_class__.trivially_copyable:
                 context = type('context', (object,),
                                {'container_element_size': cls.element.__zpp_class__.size})
-                return self.archive_type.generate_code(bytearray,
+                return self.archive_generator.generate(bytearray,
                                                        '{variable_name}.data'.format(
-                                                           variable_name=variable_name),
-                                                       self.code,
+                                                          variable_name=variable_name),
                                                        context=context)
             else:
                 item_name = '_'.join(('item', str(self._item_id())))
@@ -140,7 +140,7 @@ class SerializationGenerator(object):
                                        variable_name=variable_name))
             else:
                 self._generate_code(Uint64, 'serialization_id')
-                self.archive_type.generate_code_flush(self.code)
+                self.archive_generator.generate_flush()
                 self.code += [
                     '{variable_name} = registry[serialization_id]()' '\n'
                     '{variable_name}.{deserialize}({variable_name}, archive)'.format(
@@ -887,55 +887,77 @@ class BasicString(object):
 class MemoryOutputArchive(object):
     name = "memory"
 
+    class CodeGenerator(object):
+        def __init__(self, code):
+            self.code = code
+            self.index = 0
+
+        def generate_start(self):
+            self.code += [
+                'data = archive.data' '\n'
+                'index = archive.index'
+            ]
+
+        def generate_end(self):
+            index_string = ' '.join(('+', str(self.index)))
+            self.code += [
+                'archive.index = index{index}'.format(index=self._index_string())
+            ]
+
+        def generate_flush(self):
+            self.code += [
+                'archive.index = index{index}'.format(index=self._index_string())
+            ]
+
+        def generate(self, member_type, variable_name, context=None):
+            if not hasattr(member_type, '__zpp_class__'):
+                self.code += [
+                    'size = len({variable_name})' '\n'
+                    'data[index{index} : index{index} + size] = {variable_name}' '\n'
+                    'index += size{index}'.format(variable_name=variable_name,
+                                                  index=self._index_string())
+                ]
+                self.index = 0
+            elif member_type.__zpp_class__.fundamental:
+                size = member_type.__zpp_class__.size
+                self.code += [
+                    'data[index{index} : index{index_plus_size}] = '
+                        '{member_type}.serialize({variable_name})'.format(
+                            variable_name=variable_name,
+                            index=self._index_string(),
+                            index_plus_size=self._index_plus_size_string(size),
+                            member_type=member_type.__name__)
+                ]
+                self.index += size
+            elif member_type.__zpp_class__.trivially_copyable:
+                size = member_type.__zpp_class__.size
+                self.code += [
+                    'data[index{index} : index{index_plus_size}] = '
+                        '{variable_name}.__zpp_data__'.format(
+                            variable_name=variable_name,
+                            index=self._index_string(),
+                            index_plus_size=self._index_plus_size_string(size))
+                ]
+                self.index += size
+            else:
+                raise TypeError('Invalid argument of type %s.' % (member_type.__name__,))
+
+        def _index_string(self):
+            if self.index:
+                return ' '.join((' +', str(self.index)))
+            return ''
+
+        def _index_plus_size_string(self, size):
+            if self.index + size:
+                return ' '.join((' +', str(self.index + size)))
+            return ''
+
     def __init__(self, data, index=None):
         self.data = data
         if index is not None:
             self.index = index
         else:
             self.index = len(data)
-
-    @staticmethod
-    def generate_code_start(code):
-        code += [
-            'data = archive.data' '\n'
-            'index = archive.index'
-        ]
-
-    @staticmethod
-    def generate_code_end(code):
-        code += [
-            'archive.index = index'
-        ]
-
-    @staticmethod
-    def generate_code_flush(code):
-        code += [
-            'archive.index = index'
-        ]
-
-    @staticmethod
-    def generate_code(member_type, variable_name, code, context=None):
-        if not hasattr(member_type, '__zpp_class__'):
-            code += [
-                'size = len({variable_name})' '\n'
-                'data[index : index + size] = {variable_name}' '\n'
-                'index += size'.format(variable_name=variable_name)
-            ]
-        elif member_type.__zpp_class__.fundamental:
-            code += [
-                'data[index : index + {size}] = {member_type}.serialize({variable_name})' '\n'
-                'index += {size}'.format(variable_name=variable_name,
-                                              member_type=member_type.__name__,
-                                              size=member_type.__zpp_class__.size)
-            ]
-        elif member_type.__zpp_class__.trivially_copyable:
-            code += [
-                'data[index : index + {size}] = {variable_name}.__zpp_data__' '\n'
-                'index += {size}'.format(variable_name=variable_name,
-                                        size=member_type.__zpp_class__.size)
-            ]
-        else:
-            raise TypeError('Invalid argument of type %s.' % (member_type.__name__,))
 
     def __call__(self, *args):
         for item in args:
@@ -947,61 +969,86 @@ class MemoryOutputArchive(object):
 class MemoryInputArchive(object):
     name = "memory"
 
+    class CodeGenerator(object):
+        def __init__(self, code):
+            self.code = code
+            self.index = 0
+
+        def generate_start(self):
+            self.code += [
+                'data = archive.data' '\n'
+                'index = archive.index'
+            ]
+
+        def generate_end(self):
+            index_string = ' '.join(('+', str(self.index)))
+            self.code += [
+                'archive.index = index{index}'.format(index=self._index_string())
+            ]
+
+        def generate_flush(self):
+            self.code += [
+                'archive.index = index{index}'.format(index=self._index_string())
+            ]
+
+        def generate(self, member_type, variable_name, context=None):
+            if context and hasattr(context, 'container_element_size'):
+                self.code += [
+                    'size = container_size * {size}' '\n'
+                    '{variable_name}[:] = '
+                        'memoryview(data)[index{index} : index{index} + size]' '\n'
+                    'index += size{index}'.format(variable_name=variable_name,
+                                           size=context.container_element_size,
+                                           index=self._index_string())
+                ]
+                self.index = 0
+            elif not hasattr(member_type, '__zpp_class__'):
+                self.code += [
+                    'size = len({variable_name})' '\n'
+                    '{variable_name}[:] = '
+                        'memoryview(data)[index{index} : index{index} + size]'.format(
+                            variable_name=variable_name,
+                            index=self._index_string())
+                ]
+                self.index = 0
+            elif member_type.__zpp_class__.fundamental:
+                size = member_type.__zpp_class__.size
+                self.code += [
+                    '{variable_name} = {member_type}({member_type}.deserialize('
+                        'memoryview(data)[index{index} : index{index_plus_size}])[0])'.format(
+                            variable_name=variable_name,
+                            member_type=member_type.__name__,
+                            index=self._index_string(),
+                            index_plus_size=self._index_plus_size_string(size))
+                ]
+                self.index += size
+            elif member_type.__zpp_class__.trivially_copyable:
+                size = member_type.__zpp_class__.size
+                self.code += [
+                    '{variable_name}.__zpp_data__[:] = '
+                        'memoryview(data)[index{index} : index{index_plus_size}]'.format(
+                            variable_name=variable_name,
+                            index=self._index_string(),
+                            index_plus_size=self._index_plus_size_string(size))
+                ]
+                self.index += size
+            else:
+                raise TypeError('Invalid argument of type %s.' % (member_type.__name__,))
+
+        def _index_string(self):
+            if self.index:
+                return ' '.join((' +', str(self.index)))
+            return ''
+
+        def _index_plus_size_string(self, size):
+            if self.index + size:
+                return ' '.join((' +', str(self.index + size)))
+            return ''
+
     def __init__(self, data, index=0):
         self.data = data
         self.index = index
 
-    @staticmethod
-    def generate_code_start(code):
-        code += [
-            'data = archive.data' '\n'
-            'index = archive.index'
-        ]
-
-    @staticmethod
-    def generate_code_end(code):
-        code += [
-            'archive.index = index'
-        ]
-
-    @staticmethod
-    def generate_code_flush(code):
-        code += [
-            'archive.index = index'
-        ]
-
-    @staticmethod
-    def generate_code(member_type, variable_name, code, context=None):
-        if context and hasattr(context, 'container_element_size'):
-            code += [
-                'size = container_size * {size}' '\n'
-                '{variable_name}[:] = memoryview(data)[index : index + size]' '\n'
-                'index += size'.format(variable_name=variable_name,
-                                       size=context.container_element_size)
-            ]
-        elif not hasattr(member_type, '__zpp_class__'):
-            code += [
-                'size = len({variable_name})' '\n'
-                '{variable_name}[:] = memoryview(data)[index : index + size]' '\n'
-                'index += size'.format(variable_name=variable_name)
-            ]
-        elif member_type.__zpp_class__.fundamental:
-            code += [
-                '{variable_name} = {member_type}({member_type}.deserialize('
-                    'memoryview(data)[index : index + {size}])[0])' '\n'
-                'index += {size}'.format(variable_name=variable_name,
-                                         member_type=member_type.__name__,
-                                         size=member_type.__zpp_class__.size)
-            ]
-        elif member_type.__zpp_class__.trivially_copyable:
-            code += [
-                '{variable_name}.__zpp_data__[:] = '
-                    'memoryview(data)[index : index + {size}]' '\n'
-                'index += {size}'.format(variable_name=variable_name,
-                                         size=member_type.__zpp_class__.size)
-            ]
-        else:
-            raise TypeError('Invalid argument of type %s.' % (member_type.__name__,))
 
     def __call__(self, *args):
         return tuple(item.__zpp_class__.memory_deserialize(item, self) for item in args) if \
