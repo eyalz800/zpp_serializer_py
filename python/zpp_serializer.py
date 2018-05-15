@@ -12,50 +12,6 @@ __all__ = [
     'MemoryInputArchive', 'MemoryOutputArchive'
     ]
 
-class Uint64(long):
-    tag = '<Q'
-
-class Uint32(int):
-    tag = '<I'
-
-class Uint16(int):
-    tag = '<H'
-
-class Uint8(int):
-    tag = '<B'
-
-class Int64(long):
-    tag = '<q'
-
-class Int32(int):
-    tag = '<i'
-
-class Int16(int):
-    tag = '<h'
-
-class Int8(int):
-    tag = 'b'
-
-class Float(float):
-    tag = '<f'
-
-class Double(float):
-    tag = '<d'
-
-class Bool(int):
-    tag = '?'
-
-SizeType = Uint32
-
-for kind in (Uint64, Uint32, Uint16, Uint8, Int64, Int32, Int16, Int8, Float, Double, Bool):
-    kind.serialize = struct.Struct(kind.tag).pack
-    kind.deserialize = struct.Struct(kind.tag).unpack
-    kind.__zpp_class__ = type('zpp_class', (object,), {
-        'fundamental': True,
-        'trivially_copyable': True,
-        'size': len(kind.serialize(kind())),
-    })
-
 def make_member(member_type, value):
     if type(value) == member_type:
         return value
@@ -63,13 +19,148 @@ def make_member(member_type, value):
     if member_type.__zpp_class__.fundamental:
         return member_type(value)
 
-    if hasattr(member_type.__zpp_class__, 'container') and hasattr(value, '__len__'):
+    if member_type.__zpp_class__.container and hasattr(value, '__len__'):
         return member_type(value)
 
     if hasattr(member_type.__zpp_class__, 'serialization_id') and isinstance(value, member_type):
         return value
 
     raise TypeError("Cannot convert from %s to %s." % (type(value).__name__, member_type.__name__))
+
+def make_function(name, code):
+    environment = dict()
+    environment.update(serialization_exports)
+    exec(code, environment)
+    return environment[name]
+
+class SerializationGenerator(object):
+    class Code(list):
+        def __init__(self):
+            super(SerializationGenerator.Code, self).__init__(self)
+            self.level = 0
+
+        def __iadd__(self, lines):
+            new_lines = []
+            for line in lines:
+                for line in line.split('\n'):
+                    new_lines += [''.join((' ' * 4 * self.level, line))]
+            super(SerializationGenerator.Code, self).__iadd__(new_lines)
+            return self
+
+    def __init__(self, cls, archive_type):
+        if archive_type in output_archives:
+            self.mode = 'serialize'
+        elif archive_type in input_archives:
+            self.mode = 'deserialize'
+        else:
+            raise TypeError("Invalid archive type.")
+
+        self.function_name = '_'.join(('optimized', self.mode, cls.__name__))
+        self.cls = cls
+        self.archive_type = archive_type
+        self.code = self.Code()
+        self.code += [''.join(('def ', self.function_name, '(self, archive):'))]
+        self.code.level += 1
+        self.item_id = 0
+        self.shortcut_id = 0
+
+    def generate_code(self):
+        self.archive_type.generate_code_start(self.code)
+        self._generate_code(self.cls, 'self')
+        self.archive_type.generate_code_end(self.code)
+        zpp_class = self.cls.__zpp_class__
+        if self.mode == 'deserialize':
+           if hasattr(zpp_class, 'serialization_id') or zpp_class.fundamental:
+               self.code += ['return self']
+        return ('_'.join((self.archive_type.name, self.mode)), self.make_function())
+
+    def _item_id(self):
+        item_id = self.item_id
+        self.item_id += 1
+        return item_id
+
+    def _shortcut_id(self):
+        shortcut_id = self.shortcut_id
+        self.shortcut_id += 1
+        return shortcut_id
+
+    def _generate_code(self, cls, variable_name):
+        if not hasattr(cls, '__zpp_class__'):
+            self.archive_type.generate_code(cls, variable_name, self.code)
+            return
+
+        if cls.__zpp_class__.trivially_copyable:
+            self.archive_type.generate_code(cls, variable_name, self.code)
+            return
+
+        if cls.__zpp_class__.container:
+            if not hasattr(cls.__zpp_class__, 'array_size'):
+                if self.mode == 'serialize':
+                    self._generate_code(SizeType,
+                                       'SizeType(len({variable_name}))'.format(
+                                           variable_name=variable_name))
+                else:
+                    self._generate_code(SizeType, 'container_size')
+
+            if cls.element.__zpp_class__.trivially_copyable:
+                context = type('context', (object,),
+                               {'container_element_size': cls.element.__zpp_class__.size})
+                return self.archive_type.generate_code(bytearray,
+                                                       '{variable_name}.data'.format(
+                                                           variable_name=variable_name),
+                                                       self.code,
+                                                       context=context)
+            else:
+                item_name = '_'.join(('item', str(self._item_id())))
+                self.code += [
+                    'for {item} in {variable_name}:'.format(
+                        variable_name=variable_name,
+                        item=item_name)
+                ]
+                self.code.level += 1
+                value = self._generate_code(cls.element, item_name)
+                self.code.level -= 1
+                self.item_id -= 1
+                return value
+
+        shortcut_set = False
+        if '.' in variable_name:
+            shortcut_set = True
+            shortcut = '_'.join(('current', str(self._shortcut_id())))
+            self.code += [
+                '{shortcut} = {variable_name}'.format(shortcut=shortcut,
+                                                      variable_name=variable_name)
+            ]
+            variable_name = shortcut
+
+        if hasattr(cls.__zpp_class__, 'serialization_id'):
+            if self.mode == 'serialize':
+                self._generate_code(Uint64,
+                                   '{variable_name}.__zpp_class__.serialization_id'.format(
+                                       variable_name=variable_name))
+            else:
+                self._generate_code(Uint64, 'serialization_id')
+                self.archive_type.generate_code_flush(self.code)
+                self.code += [
+                    '{variable_name} = registry[serialization_id]()' '\n'
+                    '{variable_name}.{deserialize}({variable_name}, archive)'.format(
+                        variable_name=variable_name,
+                        deserialize='_'.join(('__zpp_class__.non_polymorphic',
+                                              self.archive_type.name,
+                                              'deserialize')))
+                ]
+                if shortcut_set:
+                    self.shortcut_id -= 1
+                return
+
+        for member in cls.__zpp_class__.members:
+            self._generate_code(getattr(cls, member),
+                                '.'.join((variable_name, member)))
+        if shortcut_set:
+            self.shortcut_id -= 1
+
+    def make_function(self):
+        return make_function(self.function_name, '\n'.join(self.code))
 
 class serializable(object):
     def __init__(self):
@@ -151,18 +242,6 @@ class serializable(object):
             result += prefix + '}'
             return result
 
-        def serialize(self, archive):
-            for name in self.__zpp_class__.members:
-                archive(getattr(self, name))
-
-        def deserialize(self, archive):
-            for name in self.__zpp_class__.members:
-                member = getattr(self, name)
-                if member.__zpp_class__.fundamental:
-                    setattr(self, name, archive(type(member)))
-                else:
-                    archive(member)
-
         cls_members = base_members + derived_members
 
         members = dict(cls.__dict__)
@@ -170,9 +249,8 @@ class serializable(object):
             '__zpp_class__': type('zpp_class', (object,), {
                 'members': cls_members,
                 'fundamental': False,
+                'container': False,
                 'trivially_copyable': False,
-                'serialize': staticmethod(serialize),
-                'deserialize': staticmethod(deserialize),
             }),
             '__init__': constructor,
             '__setattr__': assign,
@@ -181,7 +259,12 @@ class serializable(object):
             '__repr__': to_string,
             })
 
-        return type(cls.__name__, cls.__bases__, members)
+        cls = type(cls.__name__, cls.__bases__, members)
+        for archive in archives:
+            function_name, function = SerializationGenerator(cls, archive).generate_code()
+            setattr(cls.__zpp_class__, function_name, staticmethod(function))
+
+        return cls
 
     def trivially_copyable(self, cls, base_sizes, size, base_members, derived_members):
         def constructor(self, **kwargs):
@@ -203,7 +286,9 @@ class serializable(object):
             member_type = attribute
             offset = zpp_class.offsets[name]
             if member_type.__zpp_class__.fundamental:
-                return MemoryInputArchive(self.__zpp_data__, offset)(member_type)
+                size = member_type.__zpp_class__.size
+                return member_type(member_type.deserialize(
+                    memoryview(self.__zpp_data__)[offset:offset+size])[0])
             size = member_type.__zpp_class__.size
             return member_type(__zpp_data__=memoryview(self.__zpp_data__)[offset:offset+size])
 
@@ -217,7 +302,7 @@ class serializable(object):
             if member_type.__zpp_class__.fundamental:
                 self.__zpp_data__[offset:offset+size] = member_type.serialize(member_type(value))
                 return
-            if hasattr(member_type.__zpp_class__, 'container') and hasattr(value, '__len__'):
+            if member_type.__zpp_class__.container and hasattr(value, '__len__'):
                 member_type(value, __zpp_data__=memoryview(self.__zpp_data__)[offset:offset+size])
                 return
             if member_type != type(value):
@@ -243,12 +328,6 @@ class serializable(object):
             result += prefix + '}'
             return result
 
-        def serialize(self, archive):
-            archive(self.__zpp_data__)
-
-        def deserialize(self, archive):
-            archive(self.__zpp_data__)
-
         cls_members = base_members + derived_members
         offsets = dict()
         offset = 0
@@ -262,11 +341,10 @@ class serializable(object):
                 'members': cls_members,
                 'unordered_members': set(cls_members),
                 'fundamental': False,
+                'container': False,
                 'trivially_copyable': True,
                 'offsets': offsets,
                 'size': size,
-                'serialize': staticmethod(serialize),
-                'deserialize': staticmethod(deserialize),
             }),
             '__init__': constructor,
             '__getattribute__': at,
@@ -275,7 +353,12 @@ class serializable(object):
             '__repr__': to_string,
             })
 
-        return type(cls.__name__, cls.__bases__, members)
+        cls = type(cls.__name__, cls.__bases__, members)
+        for archive in archives:
+            function_name, function = SerializationGenerator(cls, archive).generate_code()
+            setattr(cls.__zpp_class__, function_name, staticmethod(function))
+
+        return cls
 
     def trace(self, frame, event, argument):
         self.names = [name for name in frame.f_code.co_names if not name.startswith('_')]
@@ -289,27 +372,21 @@ class polymorphic(serializable):
         super(polymorphic, self).__init__()
 
     def __call__(self, cls):
-        def serialize(self, archive):
-            archive(Uint64(self.__zpp_class__.serialization_id))
-            for name in self.__zpp_class__.members:
-                archive(getattr(self, name))
-
-        def deserialize(archive):
-            serialization_id = archive(Uint64)
-            item = self.registry[serialization_id]()
-            for name in item.__zpp_class__.members:
-                member = getattr(item, name)
-                if member.__zpp_class__.fundamental:
-                    setattr(item, name, archive(type(member)))
-                else:
-                    archive(member)
-            return item
-
         cls = super(polymorphic, self).__call__(cls)
         cls.__zpp_class__.serialization_id = self.serialization_id
-        cls.__zpp_class__.serialize = staticmethod(serialize)
-        cls.__zpp_class__.deserialize = staticmethod(deserialize)
         cls.__zpp_class__.trivially_copyable = False
+
+        cls = type(cls.__name__, cls.__bases__, dict(cls.__dict__))
+        for output_archive in output_archives:
+            function_name, function = SerializationGenerator(cls, output_archive).generate_code()
+            setattr(cls.__zpp_class__, function_name, staticmethod(function))
+
+        for input_archive in input_archives:
+            function_name, function = SerializationGenerator(cls, input_archive).generate_code()
+            setattr(cls.__zpp_class__, '_'.join(('non_polymorphic', function_name)),
+                   staticmethod(getattr(cls.__zpp_class__, function_name)))
+            setattr(cls.__zpp_class__, function_name, staticmethod(function))
+
         self.registry[self.serialization_id] = cls
         return cls
 
@@ -386,17 +463,6 @@ class make_vector(object):
         def iterate(self):
             return (item for item in self.items)
 
-        def serialize(self, archive):
-            archive(SizeType(len(self.items)))
-            for item in self.items:
-                archive(item)
-
-        def deserialize(self, archive):
-            size = archive(SizeType)
-            self.items = [self.element() for index in xrange(size)]
-            for item in self.items:
-                archive(item)
-
         def size(self):
             return len(self.items)
 
@@ -404,10 +470,8 @@ class make_vector(object):
         members.update({
             '__zpp_class__': type('zpp_class', (object,), {
                 'fundamental': False,
+                'container': True,
                 'trivially_copyable': False,
-                'container': None,
-                'serialize': staticmethod(serialize),
-                'deserialize': staticmethod(deserialize),
             }),
             '__init__': constructor,
             '__getitem__': at,
@@ -416,8 +480,13 @@ class make_vector(object):
             '__len__': size,
             'element': element,
         })
+        
+        cls = type(self.cls.__name__, self.cls.__bases__, members)
+        for archive in archives:
+            function_name, function = SerializationGenerator(cls, archive).generate_code()
+            setattr(cls.__zpp_class__, function_name, staticmethod(function))
 
-        return type(self.cls.__name__, self.cls.__bases__, members)
+        return cls
 
     def trivially_copyable_vector(self, element):
         def constructor(self, *args, **kwargs):
@@ -464,23 +533,12 @@ class make_vector(object):
         def size(self):
             return len(self.data) // self.element.__zpp_class__.size
 
-        def serialize(self, archive):
-            archive(SizeType(len(self.data) // self.element.__zpp_class__.size))
-            archive(self.data)
-
-        def deserialize(self, archive):
-            size = archive(SizeType)
-            self.data = bytearray(size * self.element.__zpp_class__.size)
-            archive(self.data)
-
         members = dict(self.cls.__dict__)
         members.update({
             '__zpp_class__': type('zpp_class', (object,), {
                 'fundamental': False,
+                'container': True,
                 'trivially_copyable': False,
-                'container': None,
-                'serialize': staticmethod(serialize),
-                'deserialize': staticmethod(deserialize),
             }),
             '__init__': constructor,
             '__getitem__': at,
@@ -490,7 +548,12 @@ class make_vector(object):
             'element': element,
         })
 
-        return type(self.cls.__name__, self.cls.__bases__, members)
+        cls = type(self.cls.__name__, self.cls.__bases__, members)
+        for archive in archives:
+            function_name, function = SerializationGenerator(cls, archive).generate_code()
+            setattr(cls.__zpp_class__, function_name, staticmethod(function))
+
+        return cls
 
     def fundamental_vector(self, element):
         def constructor(self, *args, **kwargs):
@@ -514,7 +577,9 @@ class make_vector(object):
                 out(make_member(self.element, value))
 
         def at(self, index):
-            return MemoryInputArchive(self.data, index * self.element.__zpp_class__.size)(self.element)
+            size = self.element.__zpp_class__.size
+            return self.element(self.element.deserialize(
+                memoryview(self.data)[index * size : (index + 1) * size])[0])
 
         def assign(self, index, value):
             size = self.element.__zpp_class__.size
@@ -530,15 +595,6 @@ class make_vector(object):
             for index in xrange(len(self.data) // self.element.__zpp_class__.size):
                 yield self[index]
 
-        def serialize(self, archive):
-            archive(SizeType(len(self.data) // self.element.__zpp_class__.size))
-            archive(self.data)
-
-        def deserialize(self, archive):
-            size = archive(SizeType)
-            self.data = bytearray(size * self.element.__zpp_class__.size)
-            archive(self.data)
-
         def size(self):
             return len(self.data) // self.element.__zpp_class__.size
 
@@ -546,10 +602,8 @@ class make_vector(object):
         members.update({
             '__zpp_class__': type('zpp_class', (object,), {
                 'fundamental': False,
+                'container': True,
                 'trivially_copyable': False,
-                'container': None,
-                'serialize': staticmethod(serialize),
-                'deserialize': staticmethod(deserialize),
             }),
             '__init__': constructor,
             '__getitem__': at,
@@ -559,7 +613,12 @@ class make_vector(object):
             'element': element,
         })
 
-        return type(self.cls.__name__, self.cls.__bases__, members)
+        cls = type(self.cls.__name__, self.cls.__bases__, members)
+        for archive in archives:
+            function_name, function = SerializationGenerator(cls, archive).generate_code()
+            setattr(cls.__zpp_class__, function_name, staticmethod(function))
+
+        return cls
 
 class make_array(object):
     def __init__(self, cls):
@@ -596,14 +655,6 @@ class make_array(object):
         def iterate(self):
             return (item for item in self.items)
 
-        def serialize(self, archive):
-            for item in self.items:
-                archive(item)
-
-        def deserialize(self, archive):
-            for item in self.items:
-                archive(item)
-
         def size(self):
             return len(self.items)
 
@@ -611,10 +662,9 @@ class make_array(object):
         members.update({
             '__zpp_class__': type('zpp_class', (object,), {
                 'fundamental': False,
+                'container': True,
                 'trivially_copyable': False,
-                'container': None,
-                'serialize': staticmethod(serialize),
-                'deserialize': staticmethod(deserialize),
+                'array_size': array_size,
             }),
             '__init__': constructor,
             '__getitem__': at,
@@ -624,7 +674,12 @@ class make_array(object):
             'element': element,
         })
 
-        return type(self.cls.__name__, self.cls.__bases__, members)
+        cls = type(self.cls.__name__, self.cls.__bases__, members)
+        for archive in archives:
+            function_name, function = SerializationGenerator(cls, archive).generate_code()
+            setattr(cls.__zpp_class__, function_name, staticmethod(function))
+
+        return cls
 
     def trivially_copyable_array(self, element, array_size):
         def constructor(self, values=None, **kwargs):
@@ -668,21 +723,13 @@ class make_array(object):
         def size(self):
             return len(self.__zpp_data__) // self.element.__zpp_class__.size
 
-        def serialize(self, archive):
-            archive(self.__zpp_data__)
-
-        def deserialize(self, archive):
-            archive(self.__zpp_data__)
-
         members = dict(self.cls.__dict__)
         members.update({
             '__zpp_class__': type('zpp_class', (object,), {
                 'fundamental': False,
+                'container': True,
                 'trivially_copyable': True,
                 'size': array_size * element.__zpp_class__.size,
-                'container': None,
-                'serialize': staticmethod(serialize),
-                'deserialize': staticmethod(deserialize),
             }),
             '__init__': constructor,
             '__getitem__': at,
@@ -692,7 +739,12 @@ class make_array(object):
             'element': element,
         })
 
-        return type(self.cls.__name__, self.cls.__bases__, members)
+        cls = type(self.cls.__name__, self.cls.__bases__, members)
+        for archive in archives:
+            function_name, function = SerializationGenerator(cls, archive).generate_code()
+            setattr(cls.__zpp_class__, function_name, staticmethod(function))
+
+        return cls
 
     def fundamental_array(self, element, array_size):
         def constructor(self, values=None, **kwargs):
@@ -711,7 +763,9 @@ class make_array(object):
                     out(self.element(value))
 
         def at(self, index):
-            return MemoryInputArchive(self.__zpp_data__, index * self.element.__zpp_class__.size)(self.element)
+            size = self.element.__zpp_class__.size
+            return self.element(self.element.deserialize(
+                memoryview(self.__zpp_data__)[index * size : (index + 1) * size])[0])
 
         def assign(self, index, value):
             size = self.element.__zpp_class__.size
@@ -734,21 +788,13 @@ class make_array(object):
         def size(self):
             return len(self.__zpp_data__) // self.element.__zpp_class__.size
 
-        def serialize(self, archive):
-            archive(self.__zpp_data__)
-
-        def deserialize(self, archive):
-            archive(self.__zpp_data__)
-
         members = dict(self.cls.__dict__)
         members.update({
             '__zpp_class__': type('zpp_class', (object,), {
                 'fundamental': False,
+                'container': True,
                 'trivially_copyable': True,
                 'size': array_size * element.__zpp_class__.size,
-                'container': None,
-                'serialize': staticmethod(serialize),
-                'deserialize': staticmethod(deserialize),
             }),
             '__init__': constructor,
             '__getitem__': at,
@@ -758,7 +804,12 @@ class make_array(object):
             'element': element,
         })
 
-        return type(self.cls.__name__, self.cls.__bases__, members)
+        cls = type(self.cls.__name__, self.cls.__bases__, members)
+        for output_archive in output_archives:
+            function_name, function = SerializationGenerator(cls, archive).generate_code()
+            setattr(cls.__zpp_class__, function_name, staticmethod(function))
+
+        return cls
 
 class make_basic_string(object):
     def __init__(self, cls):
@@ -774,7 +825,9 @@ class make_basic_string(object):
                 out(self.element(ord(value)))
 
         def at(self, index):
-            return self.character(MemoryInputArchive(self.data, index * self.element.__zpp_class__.size)(self.element))
+            size = self.element.__zpp_class__.size
+            return self.character(self.element.deserialize(
+                memoryview(self.data)[index * size : (index + 1) * size])[0])
 
         def assign(self, index, value):
             size = self.element.__zpp_class__.size
@@ -832,10 +885,9 @@ class Array(object):
 class BasicString(object):
     pass
 
-String = BasicString(Uint8)
-WString = BasicString(Uint16)
-
 class MemoryOutputArchive(object):
+    name = "memory"
+
     def __init__(self, data, index=None):
         self.data = data
         if index is not None:
@@ -843,54 +895,195 @@ class MemoryOutputArchive(object):
         else:
             self.index = len(data)
 
+    @staticmethod
+    def generate_code_start(code):
+        code += [
+            'data = archive.data' '\n'
+            'index = archive.index'
+        ]
+
+    @staticmethod
+    def generate_code_end(code):
+        code += [
+            'archive.index = index'
+        ]
+
+    @staticmethod
+    def generate_code_flush(code):
+        code += [
+            'archive.index = index'
+        ]
+
+    @staticmethod
+    def generate_code(member_type, variable_name, code, context=None):
+        if not hasattr(member_type, '__zpp_class__'):
+            code += [
+                'size = len({variable_name})' '\n'
+                'data[index : index + size] = {variable_name}' '\n'
+                'index += size'.format(variable_name=variable_name)
+            ]
+        elif member_type.__zpp_class__.fundamental:
+            code += [
+                'data[index : index + {size}] = {member_type}.serialize({variable_name})' '\n'
+                'index += {size}'.format(variable_name=variable_name,
+                                              member_type=member_type.__name__,
+                                              size=member_type.__zpp_class__.size)
+            ]
+        elif member_type.__zpp_class__.trivially_copyable:
+            code += [
+                'data[index : index + {size}] = {variable_name}.__zpp_data__' '\n'
+                'index += {size}'.format(variable_name=variable_name,
+                                        size=member_type.__zpp_class__.size)
+            ]
+        else:
+            raise TypeError('Invalid argument of type %s.' % (member_type.__name__,))
+
     def __call__(self, *args):
         for item in args:
-            if not hasattr(item, '__zpp_class__'):
-                self.data[self.index : self.index + len(item)] = item
-                self.index += len(item)
-            elif item.__zpp_class__.fundamental:
-                serialized = item.serialize(item)
-                self.data[self.index : self.index + len(serialized)] = serialized
-                self.index += len(serialized)
-            else:
-                item.__zpp_class__.serialize(item, self)
+            type(item).__zpp_class__.memory_serialize(item, self)
 
     def reset(self, index):
         self.index = index
 
 class MemoryInputArchive(object):
+    name = "memory"
+
     def __init__(self, data, index=0):
         self.data = data
         self.index = index
 
+    @staticmethod
+    def generate_code_start(code):
+        code += [
+            'data = archive.data' '\n'
+            'index = archive.index'
+        ]
+
+    @staticmethod
+    def generate_code_end(code):
+        code += [
+            'archive.index = index'
+        ]
+
+    @staticmethod
+    def generate_code_flush(code):
+        code += [
+            'archive.index = index'
+        ]
+
+    @staticmethod
+    def generate_code(member_type, variable_name, code, context=None):
+        if context and hasattr(context, 'container_element_size'):
+            code += [
+                'size = container_size * {size}' '\n'
+                '{variable_name}[:] = memoryview(data)[index : index + size]' '\n'
+                'index += size'.format(variable_name=variable_name,
+                                       size=context.container_element_size)
+            ]
+        elif not hasattr(member_type, '__zpp_class__'):
+            code += [
+                'size = len({variable_name})' '\n'
+                '{variable_name}[:] = memoryview(data)[index : index + size]' '\n'
+                'index += size'.format(variable_name=variable_name)
+            ]
+        elif member_type.__zpp_class__.fundamental:
+            code += [
+                '{variable_name} = {member_type}({member_type}.deserialize('
+                    'memoryview(data)[index : index + {size}])[0])' '\n'
+                'index += {size}'.format(variable_name=variable_name,
+                                         member_type=member_type.__name__,
+                                         size=member_type.__zpp_class__.size)
+            ]
+        elif member_type.__zpp_class__.trivially_copyable:
+            code += [
+                '{variable_name}.__zpp_data__[:] = '
+                    'memoryview(data)[index : index + {size}]' '\n'
+                'index += {size}'.format(variable_name=variable_name,
+                                         size=member_type.__zpp_class__.size)
+            ]
+        else:
+            raise TypeError('Invalid argument of type %s.' % (member_type.__name__,))
+
     def __call__(self, *args):
-        if 1 == len(args):
-            item = args[0]
-            if not hasattr(item, '__zpp_class__'):
-                item[:] = self.data[self.index : self.index + len(item)]
-                self.index += len(item)
-                return
-
-            if item.__zpp_class__.fundamental:
-                if type(item) is not type:
-                    raise TypeError("Expected a class type.")
-                size = item.__zpp_class__.size
-                result = item.deserialize(self.data[self.index : self.index + size])[0]
-                self.index += size
-                return item(result)
-
-            if hasattr(item.__zpp_class__, 'serialization_id'):
-                if type(item) is not type:
-                    raise TypeError("Expected a class type.")
-                result = item.__zpp_class__.deserialize(self)
-                if not isinstance(result, item):
-                    raise ValueError("Deserialize type mismatch.")
-                return result
-
-        for item in args:
-            if type(item) is type:
-                raise TypeError("Expected an object.")
-            item.__zpp_class__.deserialize(item, self)
+        return tuple(item.__zpp_class__.memory_deserialize(item, self) for item in args) if \
+            len(args) > 1 else args[0].__zpp_class__.memory_deserialize(args[0], self)
 
     def reset(self, index):
         self.index = index
+
+class Uint64(long):
+    tag = '<Q'
+
+class Uint32(int):
+    tag = '<I'
+
+class Uint16(int):
+    tag = '<H'
+
+class Uint8(int):
+    tag = '<B'
+
+class Int64(long):
+    tag = '<q'
+
+class Int32(int):
+    tag = '<i'
+
+class Int16(int):
+    tag = '<h'
+
+class Int8(int):
+    tag = 'b'
+
+class Float(float):
+    tag = '<f'
+
+class Double(float):
+    tag = '<d'
+
+class Bool(int):
+    tag = '?'
+
+serialization_exports = {}
+
+for kind in (Uint64, Uint32, Uint16, Uint8, Int64, Int32, Int16, Int8, Float, Double, Bool):
+    kind.serialize = struct.Struct(kind.tag).pack
+    kind.deserialize = struct.Struct(kind.tag).unpack
+
+    kind.__zpp_class__ = type('zpp_class', (object,), {
+        'fundamental': True,
+        'container': False,
+        'trivially_copyable': True,
+        'size': len(kind.serialize(kind())),
+    })
+
+SizeType = Uint32
+
+serialization_exports = {
+    'Uint64': Uint64,
+    'Uint32': Uint32,
+    'Uint16': Uint16,
+    'Uint8': Uint8,
+    'Int64': Int64,
+    'Int32': Int32,
+    'Int16': Int16,
+    'Int8': Int8,
+    'Float': Float,
+    'Double': Double,
+    'Bool': Bool,
+    'SizeType': SizeType,
+    'registry': polymorphic.registry
+}
+
+input_archives = (MemoryInputArchive,)
+output_archives = (MemoryOutputArchive,)
+archives = output_archives + input_archives
+
+String = BasicString(Uint8)
+WString = BasicString(Uint16)
+
+for kind in (Uint64, Uint32, Uint16, Uint8, Int64, Int32, Int16, Int8, Float, Double, Bool):
+    for archive in archives:
+        function_name, function = SerializationGenerator(kind, archive).generate_code()
+        setattr(kind.__zpp_class__, function_name, staticmethod(function))
+
