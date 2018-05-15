@@ -447,9 +447,10 @@ class make_vector(object):
                     values = size
                     size = len(values)
 
-            self.items = [self.element() for index in xrange(size)]
             if values:
                 self.items = [make_member(self.element, value) for value in values]
+            else:
+                self.items = [self.element() for index in range(size)]
 
         def at(self, index):
             return self.items[index]
