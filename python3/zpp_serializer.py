@@ -38,14 +38,24 @@ class SerializationGenerator(object):
         def __init__(self):
             super(SerializationGenerator.Code, self).__init__(self)
             self.level = 0
+            self.tag = None
 
         def __iadd__(self, lines):
+            self.tag = None
             new_lines = []
             for line in lines:
                 for line in line.split('\n'):
                     new_lines += [''.join((' ' * 4 * self.level, line))]
             super(SerializationGenerator.Code, self).__iadd__(new_lines)
             return self
+
+        def append_with_tag(self, tag, lines):
+            result = self.__iadd__(lines)
+            self.tag = tag
+            return result
+
+        def tag(self):
+            return self.tag
 
     def __init__(self, cls, archive_type):
         if archive_type in output_archives:
@@ -922,60 +932,89 @@ class Array(object):
 class BasicString(object):
     pass
 
-class MemoryOutputArchive(object):
-    name = "memory"
+class BasicMemoryArchiveCodeGenerator(object):
+    def __init__(self, code):
+        self.code = code
+        self.index = 0
+        self.loop = 0
+        self.indices = []
 
-    class CodeGenerator(object):
-        def __init__(self, code):
-            self.code = code
-            self.index = 0
-            self.loop = 0
-            self.indices = []
+    def generate_start(self):
+        self.code += [
+            'data = archive.data' '\n'
+            'index = archive.index'
+        ]
 
-        def generate_start(self):
+    def generate_end(self):
+        index_string = ' '.join(('+', str(self.index)))
+        self.code += [
+            'archive.index = index{index}'.format(index=self._index_string())
+        ]
+
+    def generate_flush(self):
+        self.code += [
+            'archive.index = index{index}'.format(index=self._index_string())
+        ]
+
+    def generate_reload(self):
+        self.code += [
+            'index = archive.index'
+        ]
+
+    def generate_enter_loop(self):
+        self.loop += 1
+        self.indices.append(self.index)
+
+    def generate_exit_loop(self):
+        previous_index = self.indices.pop()
+        self.loop -= 1
+        self.code.level += 1
+        if self.code.tag and 'index_addition_optimization' in self.code.tag:
+            self.code.pop()
+            expression, addition_immediate = self.code.tag['index_addition_optimization']
+            addition_immediate += self.index - previous_index
             self.code += [
-                'data = archive.data' '\n'
-                'index = archive.index'
+                'index += {expression}{difference}'.format(
+                    expression=expression,
+                    difference=self._difference_string(addition_immediate))
             ]
-
-        def generate_end(self):
-            index_string = ' '.join(('+', str(self.index)))
-            self.code += [
-                'archive.index = index{index}'.format(index=self._index_string())
-            ]
-
-        def generate_flush(self):
-            self.code += [
-                'archive.index = index{index}'.format(index=self._index_string())
-            ]
-
-        def generate_reload(self):
-            self.code += [
-                'index = archive.index'
-            ]
-
-        def generate_enter_loop(self):
-            self.loop += 1
-            self.indices.append(self.index)
-
-        def generate_exit_loop(self):
-            previous_index = self.indices.pop()
-            self.loop -= 1
-            self.code.level += 1
+        else:
             self.code += [
                 'index += {difference}'.format(difference=self.index-previous_index)
             ]
-            self.index = previous_index
-            self.code.level -= 1
+        self.index = previous_index
+        self.code.level -= 1
+
+    def _index_string(self):
+        if self.index:
+            return ' '.join((' +', str(self.index)))
+        return ''
+
+    def _index_plus_size_string(self, size):
+        if self.index + size:
+            return ' '.join((' +', str(self.index + size)))
+        return ''
+
+    def _difference_string(self, index):
+        if index:
+            return ' '.join((' +', str(index)))
+        return ''
+
+class MemoryOutputArchive(object):
+    name = "memory"
+
+    class CodeGenerator(BasicMemoryArchiveCodeGenerator):
+        def __init__(self, code):
+            super(MemoryOutputArchive.CodeGenerator, self).__init__(code)
 
         def generate(self, member_type, variable_name, context=None):
             if not hasattr(member_type, '__zpp_class__'):
-                self.code += [
+                self.code.append_with_tag({'index_addition_optimization': ('size', self.index)}, [
                     'size = len({variable_name})' '\n'
                     'data[index{index} : index{index} + size] = {variable_name}' '\n'
                     'index += size{index}'.format(variable_name=variable_name,
                                                   index=self._index_string())
-                ]
+                ])
                 self.index = 0
             elif member_type.__zpp_class__.fundamental:
                 size = member_type.__zpp_class__.size
@@ -1001,16 +1040,6 @@ class MemoryOutputArchive(object):
             else:
                 raise TypeError('Invalid argument of type %s.' % (member_type.__name__,))
 
-        def _index_string(self):
-            if self.index:
-                return ' '.join((' +', str(self.index)))
-            return ''
-
-        def _index_plus_size_string(self, size):
-            if self.index + size:
-                return ' '.join((' +', str(self.index + size)))
-            return ''
-
     def __init__(self, data, index=None):
         self.data = data
         if index is not None:
@@ -1028,68 +1057,29 @@ class MemoryOutputArchive(object):
 class MemoryInputArchive(object):
     name = "memory"
 
-    class CodeGenerator(object):
+    class CodeGenerator(BasicMemoryArchiveCodeGenerator):
         def __init__(self, code):
-            self.code = code
-            self.index = 0
-            self.loop = 0
-            self.indices = []
-
-        def generate_start(self):
-            self.code += [
-                'data = archive.data' '\n'
-                'index = archive.index'
-            ]
-
-        def generate_end(self):
-            index_string = ' '.join(('+', str(self.index)))
-            self.code += [
-                'archive.index = index{index}'.format(index=self._index_string())
-            ]
-
-        def generate_flush(self):
-            self.code += [
-                'archive.index = index{index}'.format(index=self._index_string())
-            ]
-
-        def generate_reload(self):
-            self.code += [
-                'index = archive.index'
-            ]
-
-        def generate_enter_loop(self):
-            self.loop += 1
-            self.indices.append(self.index)
-
-        def generate_exit_loop(self):
-            previous_index = self.indices.pop()
-            self.loop -= 1
-            self.code.level += 1
-            self.code += [
-                'index += {difference}'.format(difference=self.index-previous_index)
-            ]
-            self.index = previous_index
-            self.code.level -= 1
+            super(MemoryInputArchive.CodeGenerator, self).__init__(code)
 
         def generate(self, member_type, variable_name, context=None):
             if context and hasattr(context, 'container_element_size'):
-                self.code += [
+                self.code.append_with_tag({'index_addition_optimization': ('size', self.index)}, [
                     'size = container_size * {size}' '\n'
                     '{variable_name}[:] = '
                         'memoryview(data)[index{index} : index{index} + size]' '\n'
                     'index += size{index}'.format(variable_name=variable_name,
                                                   size=context.container_element_size,
                                                   index=self._index_string())
-                ]
+                ])
                 self.index = 0
             elif not hasattr(member_type, '__zpp_class__'):
-                self.code += [
+                self.code.append_with_tag({'index_addition_optimization': ('size', self.index)}, [
                     'size = len({variable_name})' '\n'
                     '{variable_name}[:] = '
                         'memoryview(data)[index{index} : index{index} + size]' '\n'
                     'index += size{index}'.format(variable_name=variable_name,
                                                   index=self._index_string())
-                ]
+                ])
                 self.index = 0
             elif member_type.__zpp_class__.fundamental:
                 size = member_type.__zpp_class__.size
@@ -1114,16 +1104,6 @@ class MemoryInputArchive(object):
                 self.index += size
             else:
                 raise TypeError('Invalid argument of type %s.' % (member_type.__name__,))
-
-        def _index_string(self):
-            if self.index:
-                return ' '.join((' +', str(self.index)))
-            return ''
-
-        def _index_plus_size_string(self, size):
-            if self.index + size:
-                return ' '.join((' +', str(self.index + size)))
-            return ''
 
     def __init__(self, data, index=0):
         self.data = data
