@@ -63,6 +63,7 @@ class SerializationGenerator(object):
         self.code.level += 1
         self.item_id = 0
         self.shortcut_id = 0
+        self.index_id = 0
         self.archive_generator = self.archive_type.CodeGenerator(self.code)
 
     def generate_code(self):
@@ -84,6 +85,11 @@ class SerializationGenerator(object):
         shortcut_id = self.shortcut_id
         self.shortcut_id += 1
         return shortcut_id
+
+    def _index_id(self):
+        index_id = self.index_id
+        self.index_id += 1
+        return index_id
 
     def _generate_code(self, cls, variable_name):
         if not hasattr(cls, '__zpp_class__'):
@@ -111,20 +117,50 @@ class SerializationGenerator(object):
                                                           variable_name=variable_name),
                                                        context=context)
             else:
+                if self.mode == 'deserialize':
+                    if hasattr(cls.element.__zpp_class__, 'serialization_id'):
+                        index_name = '_'.join(('index', str(self._index_id())))
+                        self.archive_generator.generate_enter_loop()
+                        self.code += [
+                            '{variable_name}.items = [None] * container_size' '\n'
+                            'for {index} in range(container_size):'.format(
+                                index=index_name)
+                        ]
+                        self.code.level += 1
+                        self._generate_code(cls.element,
+                                '{variable_name}[{index}]'.format(
+                                    variable_name=variable_name,
+                                    index=index_name))
+                        self.code.level -= 1
+                        self.index_id -= 1
+                        self.archive_generator.generate_exit_loop()
+                        return
+
+                    if not hasattr(cls.__zpp_class__, 'array_size'):
+                        self.code += [
+                            '{variable_name}.items = '
+                                'tuple({variable_name}.element() for i in range(container_size))'.format(
+                                    variable_name=variable_name)
+                        ]
+
                 item_name = '_'.join(('item', str(self._item_id())))
+                self.archive_generator.generate_enter_loop()
                 self.code += [
                     'for {item} in {variable_name}:'.format(
                         variable_name=variable_name,
                         item=item_name)
                 ]
                 self.code.level += 1
-                value = self._generate_code(cls.element, item_name)
+                self._generate_code(cls.element, item_name)
                 self.code.level -= 1
+                self.archive_generator.generate_exit_loop()
                 self.item_id -= 1
-                return value
+                return
+
+        is_polymorphic = hasattr(cls.__zpp_class__, 'serialization_id')
 
         shortcut_set = False
-        if '.' in variable_name:
+        if '.' in variable_name and not (is_polymorphic and self.mode == 'deserialize'):
             shortcut_set = True
             shortcut = '_'.join(('current', str(self._shortcut_id())))
             self.code += [
@@ -149,6 +185,7 @@ class SerializationGenerator(object):
                                               self.archive_type.name,
                                               'deserialize')))
                 ]
+                self.archive_generator.generate_reload()
                 if shortcut_set:
                     self.shortcut_id -= 1
                 return
@@ -892,6 +929,8 @@ class MemoryOutputArchive(object):
         def __init__(self, code):
             self.code = code
             self.index = 0
+            self.loop = 0
+            self.indices = []
 
         def generate_start(self):
             self.code += [
@@ -909,6 +948,25 @@ class MemoryOutputArchive(object):
             self.code += [
                 'archive.index = index{index}'.format(index=self._index_string())
             ]
+
+        def generate_reload(self):
+            self.code += [
+                'index = archive.index'
+            ]
+
+        def generate_enter_loop(self):
+            self.loop += 1
+            self.indices.append(self.index)
+
+        def generate_exit_loop(self):
+            previous_index = self.indices.pop()
+            self.loop -= 1
+            self.code.level += 1
+            self.code += [
+                'index += {difference}'.format(difference=self.index-previous_index)
+            ]
+            self.index = previous_index
+            self.code.level -= 1
 
         def generate(self, member_type, variable_name, context=None):
             if not hasattr(member_type, '__zpp_class__'):
@@ -974,6 +1032,8 @@ class MemoryInputArchive(object):
         def __init__(self, code):
             self.code = code
             self.index = 0
+            self.loop = 0
+            self.indices = []
 
         def generate_start(self):
             self.code += [
@@ -992,6 +1052,25 @@ class MemoryInputArchive(object):
                 'archive.index = index{index}'.format(index=self._index_string())
             ]
 
+        def generate_reload(self):
+            self.code += [
+                'index = archive.index'
+            ]
+
+        def generate_enter_loop(self):
+            self.loop += 1
+            self.indices.append(self.index)
+
+        def generate_exit_loop(self):
+            previous_index = self.indices.pop()
+            self.loop -= 1
+            self.code.level += 1
+            self.code += [
+                'index += {difference}'.format(difference=self.index-previous_index)
+            ]
+            self.index = previous_index
+            self.code.level -= 1
+
         def generate(self, member_type, variable_name, context=None):
             if context and hasattr(context, 'container_element_size'):
                 self.code += [
@@ -999,17 +1078,17 @@ class MemoryInputArchive(object):
                     '{variable_name}[:] = '
                         'memoryview(data)[index{index} : index{index} + size]' '\n'
                     'index += size{index}'.format(variable_name=variable_name,
-                                           size=context.container_element_size,
-                                           index=self._index_string())
+                                                  size=context.container_element_size,
+                                                  index=self._index_string())
                 ]
                 self.index = 0
             elif not hasattr(member_type, '__zpp_class__'):
                 self.code += [
                     'size = len({variable_name})' '\n'
                     '{variable_name}[:] = '
-                        'memoryview(data)[index{index} : index{index} + size]'.format(
-                            variable_name=variable_name,
-                            index=self._index_string())
+                        'memoryview(data)[index{index} : index{index} + size]' '\n'
+                    'index += size{index}'.format(variable_name=variable_name,
+                                                  index=self._index_string())
                 ]
                 self.index = 0
             elif member_type.__zpp_class__.fundamental:
