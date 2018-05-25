@@ -245,7 +245,9 @@ class serializable(object):
                 if hasattr(member, '__zpp_class__'):
                     object.__setattr__(self, name, member())
 
-            if args:
+            user_defined_constructor = self.__zpp_class__.user_defined_constructor
+
+            if args and not user_defined_constructor:
                 if len(args) != 1:
                     raise TypeError("Invalid argument was sent.")
                 item = args[0]
@@ -256,8 +258,39 @@ class serializable(object):
                         except Exception as error:
                             setattr(self, name, getattr(item, name)())
 
+            unordered_members = self.__zpp_class__.unordered_members
             for name, value in kwargs.items():
-                setattr(self, name, value)
+                if name in unordered_members:
+                    setattr(self, name, value)
+
+            user_defined_constructor = self.__zpp_class__.user_defined_constructor
+            if user_defined_constructor:
+                user_defined_constructor(self, *args, **{name: value for name, value in kwargs if name not in unordered_members})
+
+        def copy_constructor(self, other):
+            def initialize_bases(cls):
+                for base in cls.__bases__:
+                    if not hasattr(base, '__zpp_class__'):
+                        super(cls, self).__init__()
+                        continue
+
+                    initialize_bases(base)
+
+                    for name, member in base.__dict__.items():
+                        if hasattr(member, '__zpp_class__'):
+                            object.__setattr__(self, name, member())
+
+            initialize_bases(type(self))
+
+            for name, member in type(self).__dict__.items():
+                if hasattr(member, '__zpp_class__'):
+                    object.__setattr__(self, name, member())
+
+            for name in self.__zpp_class__.members:
+                try:
+                    setattr(self, name, getattr(other, name))
+                except Exception as error:
+                    setattr(self, name, getattr(other, name)())
 
         def assign(self, name, value):
             try:
@@ -291,9 +324,12 @@ class serializable(object):
         members.update({
             '__zpp_class__': type('zpp_class', (object,), {
                 'members': cls_members,
+                'unordered_members': set(cls_members),
                 'fundamental': False,
                 'container': False,
                 'trivially_copyable': False,
+                'copy_constructor': staticmethod(copy_constructor),
+                'user_defined_constructor': cls.__init__ if cls.__init__ not in (base.__init__ for base in cls.__bases__) else None,
             }),
             '__init__': constructor,
             '__setattr__': assign,
@@ -307,18 +343,26 @@ class serializable(object):
             function_name, function = SerializationGenerator(cls, archive).generate_code()
             setattr(cls.__zpp_class__, function_name, staticmethod(function))
 
-        cls.__zpp_class__.make = staticmethod(lambda value: cls(value))
-        cls.__zpp_class__.make_view = staticmethod(lambda value: value if type(value) == cls else cls(value))
+        def make(value):
+            obj = cls.__new__(cls)
+            copy_constructor(obj, value)
+            return obj
+
+        cls.__zpp_class__.make = staticmethod(make)
+        cls.__zpp_class__.make_view = staticmethod(lambda value: value if type(value) == cls else make(value))
         return cls
 
     def trivially_copyable(self, cls, base_sizes, size, base_members, derived_members):
         def constructor(self, *args, **kwargs):
             if '__zpp_data__' in kwargs:
                 object.__setattr__(self, '__zpp_data__', kwargs['__zpp_data__'])
+                return
             else:
                 object.__setattr__(self, '__zpp_data__', bytearray(type(self).__zpp_class__.size))
 
-            if args:
+            user_defined_constructor = self.__zpp_class__.user_defined_constructor
+
+            if args and not user_defined_constructor:
                 if len(args) != 1:
                     raise TypeError("Invalid argument was sent.")
                 item = args[0]
@@ -328,8 +372,23 @@ class serializable(object):
                     except Exception as error:
                         setattr(self, name, getattr(item, name)())
 
+            unordered_members = self.__zpp_class__.unordered_members
             for name, value in kwargs.items():
-                setattr(self, name, value)
+                if name in unordered_members:
+                    setattr(self, name, value)
+
+            user_defined_constructor = self.__zpp_class__.user_defined_constructor
+            if user_defined_constructor:
+                user_defined_constructor(self, *args, **{name: value for name, value in kwargs if name not in unordered_members})
+
+        def copy_constructor(self, other):
+            object.__setattr__(self, '__zpp_data__', bytearray(type(self).__zpp_class__.size))
+
+            for name in self.__zpp_class__.members:
+                try:
+                    setattr(self, name, getattr(other, name))
+                except Exception as error:
+                    setattr(self, name, getattr(other, name)())
 
         def at(self, name):
             attribute = object.__getattribute__(self, name)
@@ -400,6 +459,8 @@ class serializable(object):
                 'trivially_copyable': True,
                 'offsets': offsets,
                 'size': size,
+                'copy_constructor': staticmethod(copy_constructor),
+                'user_defined_constructor': cls.__init__ if cls.__init__ not in (base.__init__ for base in cls.__bases__) else None,
             }),
             '__init__': constructor,
             '__getattribute__': at,
@@ -413,8 +474,13 @@ class serializable(object):
             function_name, function = SerializationGenerator(cls, archive).generate_code()
             setattr(cls.__zpp_class__, function_name, staticmethod(function))
 
-        cls.__zpp_class__.make = staticmethod(lambda value: cls(value))
-        cls.__zpp_class__.make_view = staticmethod(lambda value: value if type(value) == cls else cls(value))
+        def make(value):
+            obj = cls.__new__(cls)
+            copy_constructor(obj, value)
+            return obj
+
+        cls.__zpp_class__.make = staticmethod(make)
+        cls.__zpp_class__.make_view = staticmethod(lambda value: value if type(value) == cls else make(value))
         return cls
 
     def trace(self, frame, event, argument):
@@ -448,8 +514,12 @@ class polymorphic(serializable):
 
         def make(value):
             if isinstance(value, cls):
-                return type(value)(value)
-            return cls(value)
+                obj = type(value).__new__(type(value))
+                obj.__zpp_class__.copy_constructor(obj, value)
+                return obj
+            obj = cls.__new__(cls)
+            obj.__zpp_class__.copy_constructor(obj, value)
+            return obj
 
         cls.__zpp_class__.make = staticmethod(make)
         cls.__zpp_class__.make_view = staticmethod(make)
