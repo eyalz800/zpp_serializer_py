@@ -251,7 +251,10 @@ class serializable(object):
                 item = args[0]
                 for name in self.__zpp_class__.members:
                     if hasattr(item, name):
-                        setattr(self, name, getattr(item, name))
+                        try:
+                            setattr(self, name, getattr(item, name))
+                        except Exception as error:
+                            setattr(self, name, getattr(item, name)())
 
             for name, value in kwargs.iteritems():
                 setattr(self, name, value)
@@ -320,8 +323,10 @@ class serializable(object):
                     raise TypeError("Invalid argument was sent.")
                 item = args[0]
                 for name in self.__zpp_class__.members:
-                    if hasattr(item, name):
+                    try:
                         setattr(self, name, getattr(item, name))
+                    except Exception as error:
+                        setattr(self, name, getattr(item, name)())
 
             for name, value in kwargs.iteritems():
                 setattr(self, name, value)
