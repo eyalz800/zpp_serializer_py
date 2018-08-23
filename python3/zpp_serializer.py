@@ -1258,13 +1258,16 @@ for kind in (Uint64, Uint32, Uint16, Uint8, Int64, Int32, Int16, Int8, Float, Do
     kind.serialize = struct.Struct(kind.tag).pack
     kind.deserialize = struct.Struct(kind.tag).unpack
 
+    def make(value, kind=kind):
+        return kind(value)
+
     kind.__zpp_class__ = type('zpp_class', (object,), {
         'fundamental': True,
         'container': False,
         'trivially_copyable': True,
         'size': len(kind.serialize(kind())),
-        'make': staticmethod(lambda value: kind(value)),
-        'make_view': staticmethod(lambda value: kind(value)),
+        'make': staticmethod(make),
+        'make_view': staticmethod(make),
     })
 
 SizeType = Uint32
